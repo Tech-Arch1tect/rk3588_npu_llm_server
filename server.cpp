@@ -2,22 +2,20 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <fstream>
+#include <sstream>
+#include <csignal>
+#include <thread>
+#include <chrono>
+
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <cpprest/http_listener.h>
 #include <cpprest/http_msg.h>
-#include <thread>
-#include <unistd.h>
+
 #include "rkllm.h"
-#include <fstream>
-#include <sstream>
-#include <csignal>
 
-#define RKLLM_VERSION "1.0.1"
-
-/* For models converted with RKLLM 1.0.1 only.
- * Use previous version for 1.0
- */
+#define RKLLM_VERSION "1.2.0"
 
 using namespace web;
 using namespace web::http;
@@ -25,27 +23,23 @@ using namespace web::http::experimental::listener;
 using namespace utility;
 using namespace std;
 
-std::string PROMPT_TEXT_PREFIX;
-std::string INPUT_STR;
-std::string PROMPT_TEXT_POSTFIX;
-std::string g_llmResponse;
 LLMHandle llmHandle = nullptr;
 
 void exitHandler(int signal) {
     if (llmHandle != nullptr) {
         std::cout << "Caught exit signal. Exiting..." << std::endl;
-        LLMHandle _tmp = llmHandle;
+        LLMHandle temp = llmHandle;
         llmHandle = nullptr;
-        rkllm_destroy(_tmp);
+        rkllm_destroy(temp);
         exit(signal);
     }
 }
 
-void callback(RKLLMResult *result, void *userdata, LLMCallState state) {
+void callback(RKLLMResult* result, void* userdata, LLMCallState state) {
     std::string* output = static_cast<std::string*>(userdata);
-    if (state == LLM_RUN_FINISH) {
+    if (state == RKLLM_RUN_FINISH) {
         printf("\n");
-    } else if (state == LLM_RUN_ERROR) {
+    } else if (state == RKLLM_RUN_ERROR) {
         printf("\nLLM run error\n");
     } else {
         *output += result->text;
@@ -69,55 +63,57 @@ void parseJson(const std::string& jsonStr, std::string& promptTextPrefix, std::s
 void handlePost(http_request message) {
     auto remoteAddress = message.remote_address();
     auto body = message.extract_string().get();
-    std::string promptTextPrefix, inputStr, promptTextPostfix;
-
     std::cout << remoteAddress << " - " << body << std::endl;
 
+    std::string promptTextPrefix, inputStr, promptTextPostfix;
     parseJson(body, promptTextPrefix, inputStr, promptTextPostfix);
 
     json::value responseJson;
-    responseJson[U("prompt_text_prefix")] = json::value::string(utility::conversions::to_string_t(promptTextPrefix));
-    responseJson[U("input_str")] = json::value::string(utility::conversions::to_string_t(inputStr));
-    responseJson[U("prompt_text_postfix")] = json::value::string(utility::conversions::to_string_t(promptTextPostfix));
+    responseJson[U("prompt_text_prefix")] = json::value::string(conversions::to_string_t(promptTextPrefix));
+    responseJson[U("input_str")] = json::value::string(conversions::to_string_t(inputStr));
+    responseJson[U("prompt_text_postfix")] = json::value::string(conversions::to_string_t(promptTextPostfix));
 
-    std::string text = responseJson[U("prompt_text_prefix")].as_string() +
-                       responseJson[U("input_str")].as_string() +
-                       responseJson[U("prompt_text_postfix")].as_string();
-
+    std::string text = promptTextPrefix + inputStr + promptTextPostfix;
     std::string llmOutput;
-    int runResult = rkllm_run(llmHandle, text.c_str(), &llmOutput);
+
+    RKLLMInput llmInput;
+    llmInput.input_type = RKLLM_INPUT_PROMPT;
+    llmInput.prompt_input = text.c_str();
+
+    RKLLMInferParam inferParams;
+    inferParams.mode = RKLLM_INFER_GENERATE;
+    inferParams.lora_params = nullptr;
+    inferParams.prompt_cache_params = nullptr;
+    inferParams.keep_history = 0;
+
+    int runResult = rkllm_run(llmHandle, &llmInput, &inferParams, static_cast<void*>(&llmOutput));
 
     if (runResult != 0) {
         std::cerr << "Error running LLM." << std::endl;
         json::value errorJson;
-        errorJson[U("content")] = json::value::string(utility::conversions::to_string_t("Error running LLM."));
-
+        errorJson[U("content")] = json::value::string(conversions::to_string_t("Error running LLM."));
         http_response response(status_codes::InternalError);
         response.set_body(errorJson.serialize());
         response.headers().add(U("Content-Type"), U("application/json"));
-
         message.reply(response).wait();
         return;
     }
 
     json::value outputJson;
-    outputJson[U("content")] = json::value::string(utility::conversions::to_string_t(llmOutput));
-
+    outputJson[U("content")] = json::value::string(conversions::to_string_t(llmOutput));
     http_response response(status_codes::OK);
     response.set_body(outputJson.serialize());
     response.headers().add(U("Content-Type"), U("application/json"));
-
     message.reply(response).wait();
 }
 
 void handleGet(http_request message) {
     json::value responseJson;
-    responseJson[U("content")] = json::value::string(utility::conversions::to_string_t("online"));
+    responseJson[U("content")] = json::value::string(conversions::to_string_t("online"));
 
     http_response response(status_codes::OK);
     response.set_body(responseJson.serialize());
     response.headers().add(U("Content-Type"), U("application/json"));
-
     message.reply(response).wait();
 }
 
@@ -136,25 +132,23 @@ int main(int argc, char* argv[]) {
 
     RKLLMParam param = rkllm_createDefaultParam();
     param.model_path = rkllmModelPath.c_str();
-    param.num_npu_core = 2;
+    param.is_async = true;
     param.top_k = 1;
     param.max_new_tokens = 256;
     param.max_context_len = 512;
 
-    int initResult = rkllm_init(&llmHandle, param, callback);
+    int initResult = rkllm_init(&llmHandle, &param, callback);
     if (initResult != 0) {
         std::cerr << "RKLLM init failed!" << std::endl;
         return -1;
     }
-
     std::cout << "RKLLM init success!" << std::endl;
 
     std::string ip = argv[1];
     std::string port = argv[2];
     std::string url = "http://" + ip + ":" + port + "/";
 
-    http_listener listener(U(url));
-
+    http_listener listener(conversions::to_string_t(url));
     listener.support(methods::POST, handlePost);
     listener.support(methods::GET, handleGet);
 
@@ -172,6 +166,5 @@ int main(int argc, char* argv[]) {
     }
 
     rkllm_destroy(llmHandle);
-
     return 0;
 }
