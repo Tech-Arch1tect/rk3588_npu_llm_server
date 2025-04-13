@@ -39,6 +39,25 @@ func RunInference(prompt string) (string, error) {
 	return result, nil
 }
 
+func RunInferenceWithFifo(prompt, fifo string) (string, error) {
+	cPrompt := C.CString(prompt)
+	defer C.free(unsafe.Pointer(cPrompt))
+	cFifo := C.CString(fifo)
+	defer C.free(unsafe.Pointer(cFifo))
+
+	const bufSize = 8192
+	outBuffer := C.malloc(C.size_t(bufSize))
+	defer C.free(outBuffer)
+
+	ret := C.rkllm_run_simple_with_fifo(cPrompt, cFifo, (*C.char)(outBuffer), C.int(bufSize))
+	if ret != 0 {
+		return "", errors.New("LLM inference error")
+	}
+
+	result := C.GoString((*C.char)(outBuffer))
+	return result, nil
+}
+
 func Destroy() {
 	C.rkllm_destroy_simple()
 }
