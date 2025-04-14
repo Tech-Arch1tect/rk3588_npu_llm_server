@@ -27,7 +27,7 @@ func main() {
 	}
 	defer file.Close()
 
-	var fifoClosed bool = false
+	var fifoClosed bool
 
 	go func() {
 		reader := bufio.NewReader(file)
@@ -37,7 +37,9 @@ func main() {
 				fifoClosed = true
 				break
 			}
-			if strings.TrimSpace(line) == "" {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "[[EOS]]" {
+				log.Println("Received EOS marker, ending stream")
 				fifoClosed = true
 				break
 			}
@@ -57,13 +59,13 @@ func main() {
 
 	prompt := "Hello, How are you?"
 
-	var output string
-	output, err = bindings.RunInferenceWithFifo(prompt, fifoPath)
+	output, err := bindings.RunInferenceWithFifo(prompt, fifoPath)
 	if err != nil {
 		log.Fatalf("Inference error: %v", err)
 	}
+
 	fmt.Println("LLM Final Output:")
-	fmt.Println(string(output[:]))
+	fmt.Println(output)
 
 	for !fifoClosed {
 		time.Sleep(1 * time.Second)
