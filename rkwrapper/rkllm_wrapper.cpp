@@ -8,9 +8,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <cerrno>
+#include <chrono>
+#include <thread>
 
 static LLMHandle llmHandle = nullptr;
-
 static std::mutex mtx;
 static std::condition_variable cv;
 static bool generation_finished = false;
@@ -18,28 +20,24 @@ static bool generation_finished = false;
 struct InferenceData {
     std::string output;
     std::string fifo_path;
+    int fifo_fd;
 };
 
-void writeToFifo_custom(const char* fifo, const char* text) {
-    if (fifo == nullptr) {
-        return;
-    }
-    int fd = open(fifo, O_WRONLY | O_NONBLOCK);
-    if (fd == -1) {
-        perror("Failed to open FIFO for writing");
-        return;
-    }
+void writeToPersistentFifo(int fd, const char* text) {
+    if (fd < 0) return;
     std::string out(text);
     out.append("\n");
-    write(fd, out.c_str(), out.size());
-    close(fd);
+    ssize_t written = write(fd, out.c_str(), out.size());
+    if (written != static_cast<ssize_t>(out.size())) {
+        perror("Failed to write to persistent FIFO");
+    }
 }
 
 void simpleCallback(RKLLMResult* result, void* userdata, LLMCallState state) {
     InferenceData* data = static_cast<InferenceData*>(userdata);
 
     if (state == RKLLM_RUN_FINISH) {
-        printf("\n");
+        writeToPersistentFifo(data->fifo_fd, "[[EOS]]");
         {
             std::lock_guard<std::mutex> lock(mtx);
             generation_finished = true;
@@ -53,11 +51,11 @@ void simpleCallback(RKLLMResult* result, void* userdata, LLMCallState state) {
         }
         cv.notify_one();
     } else {
-       {
+        {
             std::lock_guard<std::mutex> lock(mtx);
             data->output += result->text;
         }
-        writeToFifo_custom(data->fifo_path.c_str(), result->text);
+        writeToPersistentFifo(data->fifo_fd, result->text);
     }
 }
 
@@ -122,6 +120,15 @@ int rkllm_run_simple_with_fifo(const char* prompt, const char* fifo, char* outpu
     std::string promptStr(prompt);
     InferenceData* data = new InferenceData();
     data->fifo_path = fifo;
+
+    int persistent_fd = open(fifo, O_WRONLY);
+    if (persistent_fd == -1) {
+        perror("Failed to open FIFO persistently");
+        delete data;
+        return -1;
+    }
+    data->fifo_fd = persistent_fd;
+
     {
         std::unique_lock<std::mutex> lock(mtx);
         generation_finished = false;
@@ -139,6 +146,7 @@ int rkllm_run_simple_with_fifo(const char* prompt, const char* fifo, char* outpu
 
     int ret = rkllm_run(llmHandle, &llmInput, &inferParams, static_cast<void*>(data));
     if (ret != 0) {
+        close(data->fifo_fd);
         delete data;
         return ret;
     }
@@ -149,10 +157,13 @@ int rkllm_run_simple_with_fifo(const char* prompt, const char* fifo, char* outpu
     }
 
     if (data->output.size() >= static_cast<size_t>(output_size)) {
+        close(data->fifo_fd);
         delete data;
         return -2;
     }
     std::strcpy(output, data->output.c_str());
+
+    close(data->fifo_fd);
     delete data;
     return 0;
 }
